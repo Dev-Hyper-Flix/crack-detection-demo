@@ -6,35 +6,55 @@ import torchvision.transforms as transforms
 from torchvision import models
 from PIL import Image
 import io
+from pathlib import Path
 
 # Set up the page layout and title
 st.set_page_config(page_title="Crack Detection Dashboard", layout="wide")
 
 st.title("🔍 Crack Detection Dashboard")
-st.caption("Real-Time Crack Detection using U-Net and DeepLabV3+ Models")
+st.caption("Real-Time Crack Detection using Custom-Trained Deep Learning Models")
 st.markdown("---")
 
 # Initialize session state for model caching
 @st.cache_resource
-def load_models():
-    """Load pre-trained DeepLabV3+ and U-Net models"""
+def load_custom_models():
+    """Load custom-trained crack detection models"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load DeepLabV3+ with ResNet101 backbone
-    deeplab_model = models.segmentation.deeplabv3_resnet101(
-        pretrained=True,
-        progress=False
-    ).to(device)
+    checkpoint_dir = Path('./checkpoints')
+    
+    # Load custom trained model
+    model = models.segmentation.deeplabv3_resnet50(pretrained=False, num_classes=2)
+    
+    # Try to load best model checkpoint
+    best_model_path = checkpoint_dir / 'best_model.pth'
+    
+    if best_model_path.exists():
+        try:
+            checkpoint = torch.load(best_model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            st.success("✓ Custom trained model loaded successfully!")
+        except Exception as e:
+            st.warning(f"Could not load custom model: {e}")
+            st.info("Using pre-trained ImageNet weights as fallback")
+            model = models.segmentation.deeplabv3_resnet50(pretrained=True, num_classes=2)
+    else:
+        st.info("ℹ️ Custom model not found. Using pre-trained weights.")
+        st.info("Run `python train.py` to train on Kaggle crack dataset.")
+        model = models.segmentation.deeplabv3_resnet50(pretrained=True, num_classes=2)
+    
+    model.to(device)
+    model.eval()
+    
+    # Load comparison model
+    deeplab_model = models.segmentation.deeplabv3_resnet101(pretrained=True, num_classes=2)
+    deeplab_model.to(device)
     deeplab_model.eval()
     
-    # Load DeepLabV3 with ResNet50 (serves as U-Net alternative)
-    unet_model = models.segmentation.deeplabv3_resnet50(
-        pretrained=True,
-        progress=False
-    ).to(device)
-    unet_model.eval()
-    
-    return deeplab_model, unet_model, device
+    return model, deeplab_model, device
 
 def preprocess_image(image_cv):
     """Preprocess image for model inference"""
@@ -83,15 +103,16 @@ def create_crack_overlay(original_img, predictions, color, threshold=0):
     # Apply morphological operations to enhance cracks
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.dilate(kernel, iterations=1)
     
     # Create overlay
-    overlay = original_img.copy()
+    overlay = original_img.copy().astype(float)
     overlay[mask > 0] = [
-        int(overlay[mask > 0, 0] * 0.5 + color[0] * 0.5),
-        int(overlay[mask > 0, 1] * 0.5 + color[1] * 0.5),
-        int(overlay[mask > 0, 2] * 0.5 + color[2] * 0.5)
+        overlay[mask > 0, 0] * 0.5 + color[0] * 0.5,
+        overlay[mask > 0, 1] * 0.5 + color[1] * 0.5,
+        overlay[mask > 0, 2] * 0.5 + color[2] * 0.5
     ]
+    overlay = overlay.astype(np.uint8)
     
     return overlay, mask, np.sum(mask)
 
@@ -109,13 +130,12 @@ def analyze_crack_severity(mask):
         return "SEVERE", crack_percentage
 
 # Load models
-st.info("Loading AI models... This may take a moment on first run.")
-try:
-    deeplab_model, unet_model, device = load_models()
-    st.success("✓ Models loaded successfully")
-except Exception as e:
-    st.error(f"Error loading models: {e}")
-    st.stop()
+with st.spinner("Loading AI models... This may take a moment on first run."):
+    try:
+        custom_model, deeplab_model, device = load_custom_models()
+    except Exception as e:
+        st.error(f"Error loading models: {e}")
+        st.stop()
 
 # Create layout
 col_input, col_outputs = st.columns([1, 2], gap="large")
@@ -148,20 +168,20 @@ if uploaded_file is not None or use_example:
     img_tensor = preprocess_image(img)
     
     with st.spinner("🔄 Running crack detection analysis..."):
-        # U-Net predictions (using DeepLabV3-ResNet50)
-        unet_predictions = detect_cracks_with_model(img_tensor, unet_model, device)
-        unet_overlay, unet_mask, unet_crack_pixels = create_crack_overlay(
-            img.copy(), unet_predictions, (255, 0, 0)  # Red
+        # Custom trained model predictions
+        custom_predictions = detect_cracks_with_model(img_tensor, custom_model, device)
+        custom_overlay, custom_mask, custom_crack_pixels = create_crack_overlay(
+            img.copy(), custom_predictions, (255, 0, 0)  # Red
         )
         
-        # DeepLabV3+ predictions (using DeepLabV3-ResNet101)
+        # DeepLabV3+ predictions (comparison)
         deeplab_predictions = detect_cracks_with_model(img_tensor, deeplab_model, device)
         deeplab_overlay, deeplab_mask, deeplab_crack_pixels = create_crack_overlay(
-            img.copy(), deeplab_predictions, (0, 120, 255)  # Orange/Blue
+            img.copy(), deeplab_predictions, (0, 120, 255)  # Orange
         )
     
     # Analyze severity
-    unet_severity, unet_percentage = analyze_crack_severity(unet_mask)
+    custom_severity, custom_percentage = analyze_crack_severity(custom_mask)
     deeplab_severity, deeplab_percentage = analyze_crack_severity(deeplab_mask)
     
     # Display results
@@ -169,37 +189,37 @@ if uploaded_file is not None or use_example:
         st.header("📊 Analysis Results")
         
         # Overall detection status
-        if unet_severity == "NONE" and deeplab_severity == "NONE":
+        if custom_severity == "NONE" and deeplab_severity == "NONE":
             st.success("✓ No Cracks Detected")
             status_text = "✓ CLEAR SURFACE - No structural anomalies found"
         else:
             st.warning("⚠ Cracks Detected")
-            status_text = f"⚠ {max(unet_severity, deeplab_severity)} severity - Structural anomalies detected"
+            status_text = f"⚠ {max(custom_severity, deeplab_severity)} severity - Structural anomalies detected"
         
         st.markdown(f"### {status_text}")
         
         # Metrics
-        st.markdown("**U-Net Analysis:**")
-        st.metric("Crack Coverage", f"{unet_percentage:.2f}%", "Severity: " + unet_severity)
+        st.markdown("**Custom Trained Model:**")
+        st.metric("Crack Coverage", f"{custom_percentage:.2f}%", "Severity: " + custom_severity)
         
-        st.markdown("**DeepLabV3+ Analysis:**")
+        st.markdown("**DeepLabV3+ (Reference):**")
         st.metric("Crack Coverage", f"{deeplab_percentage:.2f}%", "Severity: " + deeplab_severity)
     
     with col_outputs:
         st.header("🧠 Model Execution Pipeline")
-        col_unet, col_deeplab = st.columns(2)
+        col_custom, col_deeplab = st.columns(2)
         
-        with col_unet:
-            st.markdown("#### <span style='color: #e53e3e;'>🔴 U-Net Output</span>", unsafe_allow_html=True)
-            st.markdown(f"**Cracks Detected:** {unet_severity} ({unet_percentage:.2f}%)")
+        with col_custom:
+            st.markdown("#### <span style='color: #e53e3e;'>🔴 Custom Trained Model</span>", unsafe_allow_html=True)
+            st.markdown(f"**Cracks Detected:** {custom_severity} ({custom_percentage:.2f}%)")
             st.image(
-                cv2.cvtColor(unet_overlay, cv2.COLOR_BGR2RGB),
+                cv2.cvtColor(custom_overlay, cv2.COLOR_BGR2RGB),
                 use_container_width=True,
                 caption="Red overlay = Detected anomalies"
             )
         
         with col_deeplab:
-            st.markdown("#### <span style='color: #3182ce;'>🔵 DeepLabV3+ Output</span>", unsafe_allow_html=True)
+            st.markdown("#### <span style='color: #3182ce;'>🔵 DeepLabV3+ (Reference)</span>", unsafe_allow_html=True)
             st.markdown(f"**Cracks Detected:** {deeplab_severity} ({deeplab_percentage:.2f}%)")
             st.image(
                 cv2.cvtColor(deeplab_overlay, cv2.COLOR_BGR2RGB),
@@ -215,7 +235,7 @@ if uploaded_file is not None or use_example:
     
     with comparison_col1:
         st.subheader("Detection Difference")
-        difference = abs(unet_percentage - deeplab_percentage)
+        difference = abs(custom_percentage - deeplab_percentage)
         st.metric("Coverage Variance", f"{difference:.2f}%")
         
         if difference < 1:
@@ -228,11 +248,11 @@ if uploaded_file is not None or use_example:
     with comparison_col2:
         st.subheader("Recommendation")
         
-        if unet_severity == "NONE" and deeplab_severity == "NONE":
+        if custom_severity == "NONE" and deeplab_severity == "NONE":
             st.success("✅ Surface Status: CLEAR\n\nNo maintenance required.")
-        elif max(unet_severity, deeplab_severity) == "SEVERE":
+        elif max(custom_severity, deeplab_severity) == "SEVERE":
             st.error("🚨 IMMEDIATE ACTION REQUIRED\n\nSurface shows severe damage.")
-        elif max(unet_severity, deeplab_severity) == "MEDIUM":
+        elif max(custom_severity, deeplab_severity) == "MEDIUM":
             st.warning("⚠️ SCHEDULE MAINTENANCE\n\nModerate damage detected.")
         else:
             st.info("ℹ️ MONITOR\n\nMinor damage - continue monitoring.")
@@ -246,3 +266,16 @@ else:
     with col_outputs:
         st.header("🧠 Model Execution Pipeline")
         st.info("👆 Upload an image in the left panel to start crack detection analysis...")
+        
+        st.markdown("---")
+        st.info("""
+        **Model Information:**
+        - 🔴 Custom Trained Model: Fine-tuned on Kaggle Crack Segmentation Dataset
+        - 🔵 DeepLabV3+: Pre-trained reference model for comparison
+        
+        **Training Details:**
+        To train the custom model on your dataset, run:
+        ```
+        python train.py
+        ```
+        """)
